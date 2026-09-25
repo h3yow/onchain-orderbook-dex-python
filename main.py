@@ -1,12 +1,10 @@
 import uvicorn
-from fastapi import FastAPI
 
-app = FastAPI()
+from app.api import create_app
+from app.service import DexService
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+service = DexService(ledger_path="ledger.json")
+app = create_app(service)
 
 
 if __name__ == "__main__":
