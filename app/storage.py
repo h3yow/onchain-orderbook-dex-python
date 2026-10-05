@@ -63,6 +63,7 @@ def encode_state(state: LedgerState) -> str:
     data = {
         "balances": {f"{a}|{asset}": str(v) for (a, asset), v in state.balances.items()},
         "frozen": {f"{a}|{asset}": str(v) for (a, asset), v in state.frozen.items()},
+        "credited": {asset: str(v) for asset, v in state.credited.items()},
         "orders": {oid: _order_to_json(o) for oid, o in state.orders.items()},
         "fills": [_fill_to_json(f) for f in state.fills],
         "markets": {
@@ -138,6 +139,14 @@ def decode_state(raw: str) -> LedgerState:
     for k, v in data.get("frozen", {}).items():
         account, asset = k.split("|", 1)
         state.frozen[(account, asset)] = Decimal(v)
+    state.credited = {
+        asset: Decimal(v) for asset, v in data.get("credited", {}).items()
+    }
+    if not state.credited and state.balances:
+        # legacy ledger without credit tracking: assume it was consistent
+        # at save time and derive the conservation baseline from balances
+        for (_, asset), v in state.balances.items():
+            state.credited[asset] = state.credited.get(asset, Decimal(0)) + v
     state.orders = {oid: _order_from_json(d) for oid, d in data.get("orders", {}).items()}
     state.fills = [_fill_from_json(d) for d in data.get("fills", [])]
     state.markets = {

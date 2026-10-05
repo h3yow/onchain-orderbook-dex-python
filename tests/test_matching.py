@@ -88,9 +88,14 @@ def test_multi_level_partial_taker(service):
     assert buy["fills"][0]["price"] == "99"
     assert buy["fills"][1]["price"] == "100"
     print("STATE taker walked 2 levels, filled:", buy["filled_quantity"])
-    # filled 0.3@99 + 0.5@100 = 79.7 cost; froze 90 -> 10.3 quote left frozen
-    _, frozen_usdc = bal(service, "alice", "USDC")
-    assert frozen_usdc == Decimal("10.3")  # 0.1 qty * 100 + price improvement 0.3
+    # filled 0.3@99 + 0.5@100 = 79.7 actual cost; froze 90 upfront.
+    # Only the remaining 0.1 qty * 100 limit stays frozen; the 0.3 price
+    # improvement (0.3 qty bought at 99 instead of 100) is released back
+    # to available immediately at settlement time.
+    alice_bal, frozen_usdc = bal(service, "alice", "USDC")
+    assert frozen_usdc == Decimal("10.0")  # 0.1 remaining qty * 100 limit
+    assert alice_bal == Decimal("100000") - Decimal("79.7")
+    assert alice_bal - frozen_usdc == Decimal("100000") - Decimal("90") + Decimal("0.3")
     btc_bal, _ = bal(service, "alice", "BTC")
     assert btc_bal == Decimal("0.8")
     assert_conservation(service, baseline)

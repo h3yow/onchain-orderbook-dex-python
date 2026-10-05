@@ -102,3 +102,51 @@ def test_halted_market_blocks_over_http(client):
     body = r.json()
     assert body["fills"] == [] and body["blocked_reason"] == "MARKET_HALTED"
     print("ASSERT halt exposed in order response over HTTP")
+
+
+def test_new_endpoints_over_http(client):
+    c, _ = client
+    h = {"X-Admin-Token": "secret"}
+    c.post("/admin/credit", headers=h,
+           json={"account": "a", "asset": "USDC", "amount": "10000"})
+    c.post("/admin/reference-price", headers=h,
+           json={"market": "BTC-USDC", "price": "100"})
+    o1 = c.post("/orders", json={"market": "BTC-USDC", "account": "a",
+                                 "side": "BUY", "price": "100",
+                                 "quantity": "1"}).json()
+    o2 = c.post("/orders", json={"market": "BTC-USDC", "account": "a",
+                                 "side": "BUY", "price": "99",
+                                 "quantity": "2"}).json()
+
+    # lockup detail
+    locks = c.get("/accounts/a/locks").json()
+    assert locks["account"] == "a" and len(locks["locks"]) == 2
+    assert locks["totals"]["USDC"]["frozen"] == "298"
+    assert locks["totals"]["USDC"]["locked"] == "298"
+    filtered = c.get("/accounts/a/locks", params={"market": "BTC-USDC"}).json()
+    assert len(filtered["locks"]) == 2
+    print("ASSERT /accounts/{account}/locks list+totals over HTTP")
+
+    # batch cancel (explicit, idempotent)
+    r = c.post("/orders/batch-cancel",
+               json={"account": "a",
+                     "order_ids": [o1["order_id"], o2["order_id"]],
+                     "idempotency_key": "http-bc"})
+    body = r.json()
+    assert r.status_code == 200 and body["applied"] is True
+    assert body["cancelled"] == 2
+    replay = c.post("/orders/batch-cancel",
+                    json={"account": "a",
+                          "order_ids": [o1["order_id"], o2["order_id"]],
+                          "idempotency_key": "http-bc"}).json()
+    assert replay == body
+    locks = c.get("/accounts/a/locks").json()
+    assert locks["locks"] == []
+    assert locks["totals"]["USDC"]["frozen"] == "0"
+    print("ASSERT /orders/batch-cancel + idempotent replay over HTTP")
+
+    # reconcile (admin-only, read-only)
+    assert c.get("/admin/reconcile").json()["error"] == "UNAUTHORIZED"
+    rec = c.get("/admin/reconcile", headers=h).json()
+    assert rec["ok"] is True and rec["discrepancies"] == []
+    print("ASSERT /admin/reconcile auth + clean result over HTTP")

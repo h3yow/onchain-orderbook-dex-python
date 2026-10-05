@@ -95,6 +95,9 @@ class MarketConfig:
 class LedgerState:
     balances: dict[tuple[str, str], Decimal] = field(default_factory=dict)
     frozen: dict[tuple[str, str], Decimal] = field(default_factory=dict)
+    # total ever credited per asset (only admin credit creates assets;
+    # settlement merely moves them) — the conservation baseline for audits
+    credited: dict[str, Decimal] = field(default_factory=dict)
     orders: dict[str, Order] = field(default_factory=dict)
     fills: list[Fill] = field(default_factory=list)
     markets: dict[str, MarketConfig] = field(default_factory=dict)
@@ -129,6 +132,13 @@ class PlaceOrderRequest(BaseModel):
 class CancelOrderRequest(BaseModel):
     order_id: str
     account: str
+    idempotency_key: str | None = None
+
+
+class BatchCancelRequest(BaseModel):
+    account: str
+    market: str | None = None
+    order_ids: list[str] | None = None
     idempotency_key: str | None = None
 
 

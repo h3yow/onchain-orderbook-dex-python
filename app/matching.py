@@ -151,15 +151,26 @@ class MatchingEngine:
         quote = state.markets[taker.market].quote_asset
 
         # ---- buyer side
-        # balance includes frozen amounts; settlement spends the reserved
-        # quote, so both balance AND frozen decrease by ``cost``.
-        bf = state.frozen.get((buyer, quote), Decimal(0)) - cost
+        # balance includes frozen amounts; settlement spends the actual
+        # ``cost`` (maker price), while the reservation for this tranche was
+        # ``buyer_order.price * qty`` (the buyer's own limit). Releasing the
+        # full reservation immediately returns any price-improvement
+        # difference (limit - execution) to the buyer's available balance.
+        reserved = buyer_order.price * qty
+        bf = state.frozen.get((buyer, quote), Decimal(0)) - reserved
         if bf < 0:
             raise RuntimeError(f"buyer frozen quote would go negative: {buyer}")
         state.frozen[(buyer, quote)] = bf
         state.balances[(buyer, quote)] = (
             state.balances.get((buyer, quote), Decimal(0)) - cost
         )
+        if reserved > cost:
+            logger.info(
+                "price improvement released: buyer=%s order_id=%s "
+                "limit=%s exec=%s qty=%s returned=%s %s",
+                buyer, buyer_order.order_id, buyer_order.price, price, qty,
+                reserved - cost, quote,
+            )
         state.balances[(buyer, base)] = (
             state.balances.get((buyer, base), Decimal(0)) + qty
         )
@@ -201,9 +212,9 @@ class MatchingEngine:
         )
         state.fills.append(fill)
         logger.info(
-            "settled: buyer=%s base+=%s quote_frozen-=%s | seller=%s "
+            "settled: buyer=%s base+=%s quote-=%s quote_frozen-=%s | seller=%s "
             "quote+=%s base_frozen-=%s | taker %s->%s maker %s->%s",
-            buyer, qty, cost, seller, cost, qty,
+            buyer, qty, cost, reserved, seller, cost, qty,
             taker.order_id, taker.status.value, maker.order_id, maker.status.value,
         )
         return fill

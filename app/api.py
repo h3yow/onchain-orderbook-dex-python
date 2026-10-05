@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from app.errors import DexError
 from app.models import (
+    BatchCancelRequest,
     CancelOrderRequest,
     CreditRequest,
     HaltRequest,
@@ -36,6 +37,10 @@ def create_app(service) -> FastAPI:
     def cancel_order(req: CancelOrderRequest):
         return service.cancel_order(req)
 
+    @app.post("/orders/batch-cancel")
+    def batch_cancel(req: BatchCancelRequest):
+        return service.batch_cancel(req)
+
     @app.get("/orders/{order_id}")
     def get_order(order_id: str):
         return service.get_order(order_id)
@@ -43,6 +48,10 @@ def create_app(service) -> FastAPI:
     @app.get("/accounts/{account}/balances/{asset}")
     def get_balance(account: str, asset: str):
         return service.get_balance(account, asset)
+
+    @app.get("/accounts/{account}/locks")
+    def get_locks(account: str, market: str | None = None):
+        return service.get_locks(account, market)
 
     @app.get("/markets")
     def get_snapshot(market: str | None = None):
@@ -82,5 +91,10 @@ def create_app(service) -> FastAPI:
         service.require_admin(x_admin_token)
         service.set_halted(req.market, req.halted)
         return {"status": "ok", "market": req.market, "halted": req.halted}
+
+    @app.get("/admin/reconcile")
+    def admin_reconcile(x_admin_token: str = Header(default="")):
+        service.require_admin(x_admin_token)
+        return service.reconcile()
 
     return app
