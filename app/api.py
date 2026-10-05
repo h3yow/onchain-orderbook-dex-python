@@ -9,7 +9,9 @@ from fastapi.responses import JSONResponse
 
 from app.errors import DexError
 from app.models import (
+    BatchCancelRequest,
     CancelOrderRequest,
+    CancelScopeRequest,
     CreditRequest,
     HaltRequest,
     PlaceOrderRequest,
@@ -35,6 +37,22 @@ def create_app(service) -> FastAPI:
     @app.post("/orders/cancel")
     def cancel_order(req: CancelOrderRequest):
         return service.cancel_order(req)
+
+    @app.post("/orders/cancel-batch")
+    def cancel_batch(req: BatchCancelRequest):
+        return service.cancel_batch(req)
+
+    @app.post("/orders/cancel-all")
+    def cancel_all(req: CancelScopeRequest):
+        return service.cancel_scope(req)
+
+    @app.get("/accounts/{account}/funds")
+    def get_funds(account: str, market: str | None = None):
+        return service.get_funds(account, market)
+
+    @app.get("/reconcile")
+    def reconcile():
+        return service.reconcile()
 
     @app.get("/orders/{order_id}")
     def get_order(order_id: str):

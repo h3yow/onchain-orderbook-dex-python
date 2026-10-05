@@ -87,6 +87,7 @@ def encode_state(state: LedgerState) -> str:
             for s, r in state.risk.items()
         },
         "halted": dict(state.halted),
+        "credited": {asset: str(v) for asset, v in state.credited.items()},
         "idempotency": [
             {"key": k, "kind": kind, "payload": payload}
             for k, (kind, payload) in state.idempotency.items()
@@ -162,6 +163,14 @@ def decode_state(raw: str) -> LedgerState:
         for s, r in data.get("risk", {}).items()
     }
     state.halted = dict(data.get("halted", {}))
+    if "credited" in data:
+        state.credited = {a: Decimal(v) for a, v in data["credited"].items()}
+    else:
+        # migration for ledgers written before reconciliation existed:
+        # balances are the conserved quantity, so their per-asset sums are
+        # exactly the historical credit totals
+        for (_account, asset), v in state.balances.items():
+            state.credited[asset] = state.credited.get(asset, Decimal(0)) + v
     state.idempotency = {
         item["key"]: (item["kind"], item["payload"]) for item in data.get("idempotency", [])
     }

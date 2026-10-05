@@ -102,3 +102,59 @@ def test_halted_market_blocks_over_http(client):
     body = r.json()
     assert body["fills"] == [] and body["blocked_reason"] == "MARKET_HALTED"
     print("ASSERT halt exposed in order response over HTTP")
+
+
+def test_new_endpoints_over_http(client):
+    c, svc = client
+    h = {"X-Admin-Token": "secret"}
+    c.post("/admin/credit", headers=h,
+           json={"account": "a", "asset": "USDC", "amount": "10000"})
+    c.post("/admin/reference-price", headers=h,
+           json={"market": "BTC-USDC", "price": "100"})
+
+    ids = []
+    for price in ("100", "90"):
+        r = c.post("/orders", json={"market": "BTC-USDC", "account": "a",
+                                    "side": "BUY", "price": price,
+                                    "quantity": "1"})
+        assert r.status_code == 200
+        ids.append(r.json()["order_id"])
+
+    # funds breakdown
+    r = c.get("/accounts/a/funds", params={"market": "BTC-USDC"})
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["locked"]) == 2
+    usdc = next(x for x in body["assets"] if x["asset"] == "USDC")
+    assert Decimal(usdc["frozen"]) == 190
+    print("STATE http funds:", usdc)
+
+    # batch cancel with a bad item -> 400 INVALID_BATCH, funds untouched
+    r = c.post("/orders/cancel-batch",
+               json={"account": "a", "order_ids": ids + ["ord_nope"]})
+    assert r.status_code == 400
+    assert r.json()["error"] == "INVALID_BATCH"
+    assert Decimal(c.get("/accounts/a/balances/USDC").json()["frozen"]) == 190
+
+    # valid batch cancel with idempotency key
+    r = c.post("/orders/cancel-batch",
+               json={"account": "a", "order_ids": ids,
+                     "idempotency_key": "http-batch"})
+    assert r.status_code == 200
+    assert r.json()["cancelled_count"] == 2
+    replay = c.post("/orders/cancel-batch",
+                    json={"account": "a", "order_ids": ids,
+                          "idempotency_key": "http-batch"})
+    assert replay.json() == r.json()
+    assert Decimal(c.get("/accounts/a/balances/USDC").json()["frozen"]) == 0
+
+    # scope cancel (nothing left active -> all skipped) and reconcile
+    r = c.post("/orders/cancel-all", json={"account": "a"})
+    assert r.status_code == 200
+    assert r.json()["cancelled_count"] == 0
+    assert r.json()["skipped_count"] == 2
+
+    rec = c.get("/reconcile").json()
+    print("STATE http reconcile:", rec["ok"])
+    assert rec["ok"] is True
+    print("ASSERT http funds/batch-cancel/cancel-all/reconcile ok")

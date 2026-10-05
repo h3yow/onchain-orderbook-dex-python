@@ -151,9 +151,14 @@ class MatchingEngine:
         quote = state.markets[taker.market].quote_asset
 
         # ---- buyer side
-        # balance includes frozen amounts; settlement spends the reserved
-        # quote, so both balance AND frozen decrease by ``cost``.
-        bf = state.frozen.get((buyer, quote), Decimal(0)) - cost
+        # balance includes frozen amounts; settlement spends the actual
+        # ``cost`` from balances, but the order had reserved
+        # ``buyer_order.price * qty`` per unit. When the execution price is
+        # better than the buyer's limit (taker crossing a cheaper maker),
+        # the excess reservation is released back to available immediately,
+        # so a fully filled order never keeps funds locked.
+        reserved = buyer_order.price * qty
+        bf = state.frozen.get((buyer, quote), Decimal(0)) - reserved
         if bf < 0:
             raise RuntimeError(f"buyer frozen quote would go negative: {buyer}")
         state.frozen[(buyer, quote)] = bf
@@ -201,9 +206,9 @@ class MatchingEngine:
         )
         state.fills.append(fill)
         logger.info(
-            "settled: buyer=%s base+=%s quote_frozen-=%s | seller=%s "
+            "settled: buyer=%s base+=%s quote_paid=%s quote_frozen-=%s | seller=%s "
             "quote+=%s base_frozen-=%s | taker %s->%s maker %s->%s",
-            buyer, qty, cost, seller, cost, qty,
+            buyer, qty, cost, reserved, seller, cost, qty,
             taker.order_id, taker.status.value, maker.order_id, maker.status.value,
         )
         return fill

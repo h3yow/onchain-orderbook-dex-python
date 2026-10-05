@@ -38,6 +38,7 @@ class ErrorCode(str, enum.Enum):
     PRICE_OUT_OF_BAND = "PRICE_OUT_OF_BAND"
     UNAUTHORIZED = "UNAUTHORIZED"
     INVALID_RISK_PARAMS = "INVALID_RISK_PARAMS"
+    INVALID_BATCH = "INVALID_BATCH"
 
 
 @dataclass
@@ -102,6 +103,9 @@ class LedgerState:
     risk: dict[str, RiskParams] = field(default_factory=dict)
     halted: dict[str, bool] = field(default_factory=dict)
     idempotency: dict[str, tuple[str, dict[str, Any]]] = field(default_factory=dict)
+    # asset -> total amount ever credited; the conservation baseline used
+    # by reconciliation (settlements only move balances between accounts)
+    credited: dict[str, Decimal] = field(default_factory=dict)
     order_sequence: int = 0
     fill_sequence: int = 0
 
@@ -129,6 +133,20 @@ class PlaceOrderRequest(BaseModel):
 class CancelOrderRequest(BaseModel):
     order_id: str
     account: str
+    idempotency_key: str | None = None
+
+
+class BatchCancelRequest(BaseModel):
+    """Cancel an explicit list of orders atomically (all-or-nothing)."""
+    account: str
+    order_ids: list[str]
+    idempotency_key: str | None = None
+
+
+class CancelScopeRequest(BaseModel):
+    """Cancel every still-active order of an account, optionally in one market."""
+    account: str
+    market: str | None = None
     idempotency_key: str | None = None
 
 

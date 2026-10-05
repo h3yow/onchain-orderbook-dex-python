@@ -89,6 +89,7 @@ class DexService:
                                f"credit amount must be positive, got {amount}")
             key = (account, asset)
             self.state.balances[key] = self.state.balances.get(key, ZERO) + amount
+            self.state.credited[asset] = self.state.credited.get(asset, ZERO) + amount
             logger.info("credit account=%s asset=%s amount=%s new_balance=%s",
                         account, asset, amount, self.state.balances[key])
             self._persist()
@@ -256,34 +257,315 @@ class DexService:
                                f"order {req.order_id} is {order.status.value}, "
                                "cannot cancel")
 
-            market = self.state.markets[order.market]
-            remaining = order.quantity - order.filled_qty
-            if order.side is Side.BUY:
-                asset = market.quote_asset
-                release = remaining * order.price
-            else:
-                asset = market.base_asset
-                release = remaining
-            key = (order.account, asset)
-            frozen = self.state.frozen.get(key, ZERO)
-            if frozen < release:
-                # should never happen with correct settlement; reported distinctly
-                raise DexError(
-                    ErrorCode.INSUFFICIENT_FROZEN,
-                    f"cannot release {release} {asset}, frozen={frozen} "
-                    "(ledger corruption?)",
-                )
-            self.state.frozen[key] = frozen - release
-            order.status = OrderStatus.CANCELLED
+            release = self._release_and_cancel(order)
             logger.info(
                 "order cancelled order_id=%s account=%s released=%s %s "
                 "filled_qty=%s status NEW->CANCELLED",
-                order.order_id, order.account, release, asset, order.filled_qty,
+                order.order_id, order.account, release[1], release[0],
+                order.filled_qty,
             )
             result = self._order_view(order)
             self._store_idempotent(req.idempotency_key, "cancel_order", result, fingerprint)
             self._persist()
             return result
+
+    # ------------------------------------------------------- account funds
+
+    def get_funds(self, account: str, market: str | None = None) -> dict:
+        """Per-order locked-funds breakdown plus per-asset totals.
+
+        The locked rows are derived from the live order state, and the
+        per-asset ``frozen`` totals are the ledger's own counters; the
+        reconciliation endpoint verifies the two always agree.
+        """
+        with self._lock:
+            if market is not None:
+                self._require_market(market)
+            locked: list[dict] = []
+            for order in self.state.orders.values():
+                if order.account != account:
+                    continue
+                if market is not None and order.market != market:
+                    continue
+                if order.status not in (OrderStatus.NEW,
+                                        OrderStatus.PARTIALLY_FILLED):
+                    continue
+                cfg = self.state.markets[order.market]
+                remaining = order.quantity - order.filled_qty
+                if order.side is Side.BUY:
+                    asset, amount = cfg.quote_asset, remaining * order.price
+                else:
+                    asset, amount = cfg.base_asset, remaining
+                locked.append({
+                    "order_id": order.order_id,
+                    "market": order.market,
+                    "side": order.side.value,
+                    "price": str(order.price),
+                    "remaining_quantity": str(remaining),
+                    "asset": asset,
+                    "locked_amount": str(amount),
+                })
+            locked.sort(key=lambda row: row["order_id"])
+
+            assets: list[dict] = []
+            seen = {a for (acc, a) in self.state.balances if acc == account}
+            seen |= {a for (acc, a) in self.state.frozen if acc == account}
+            seen |= {row["asset"] for row in locked}
+            for asset in sorted(seen):
+                balance = self.state.balances.get((account, asset), ZERO)
+                frozen = self.state.frozen.get((account, asset), ZERO)
+                assets.append({
+                    "asset": asset,
+                    "balance": str(balance),
+                    "frozen": str(frozen),
+                    "available": str(balance - frozen),
+                })
+            logger.info("funds query account=%s market=%s locked_orders=%d",
+                        account, market, len(locked))
+            return {"account": account, "market": market,
+                    "locked": locked, "assets": assets}
+
+    # ---------------------------------------------------------- batch cancel
+
+    def cancel_batch(self, req: Any) -> dict:
+        """Atomically cancel an explicit list of orders (all-or-nothing).
+
+        Every item is validated before any fund is released: a missing,
+        foreign, already-finished or duplicated order id aborts the whole
+        batch with INVALID_BATCH and the account's funds stay untouched.
+        """
+        with self._lock:
+            order_ids = [str(oid) for oid in req.order_ids]
+            fingerprint = {
+                "type": "cancel_batch",
+                "account": str(req.account),
+                "order_ids": list(order_ids),
+            }
+            cached = self._idempotency_check(req.idempotency_key, fingerprint)
+            if cached is not None:
+                logger.info("idempotent replay key=%s cancel_batch account=%s",
+                            req.idempotency_key, req.account)
+                return cached
+
+            if not order_ids:
+                raise DexError(ErrorCode.INVALID_BATCH,
+                               "order_ids must be a non-empty list")
+
+            # ---- validate everything first; nothing is mutated in this pass
+            seen: set[str] = set()
+            targets: list[Order] = []
+            for idx, oid in enumerate(order_ids):
+                if oid in seen:
+                    raise DexError(
+                        ErrorCode.INVALID_BATCH,
+                        f"item[{idx}] order {oid}: duplicated in request; "
+                        "whole batch rejected, no funds changed",
+                    )
+                seen.add(oid)
+                order = self.state.orders.get(oid)
+                if order is None:
+                    raise DexError(
+                        ErrorCode.INVALID_BATCH,
+                        f"item[{idx}] order {oid}: not found; "
+                        "whole batch rejected, no funds changed",
+                    )
+                if order.account != req.account:
+                    raise DexError(
+                        ErrorCode.INVALID_BATCH,
+                        f"item[{idx}] order {oid}: belongs to another account; "
+                        "whole batch rejected, no funds changed",
+                    )
+                if order.status not in (OrderStatus.NEW,
+                                        OrderStatus.PARTIALLY_FILLED):
+                    raise DexError(
+                        ErrorCode.INVALID_BATCH,
+                        f"item[{idx}] order {oid}: already {order.status.value}; "
+                        "whole batch rejected, no funds changed",
+                    )
+                targets.append(order)
+
+            # ---- all items valid: cancel every one (single lock => atomic)
+            results = []
+            for order in targets:
+                asset, released = self._release_and_cancel(order)
+                logger.info("batch cancel order_id=%s released=%s %s",
+                            order.order_id, released, asset)
+                results.append({
+                    "order_id": order.order_id,
+                    "result": "cancelled",
+                    "asset": asset,
+                    "released_amount": str(released),
+                })
+            result = {
+                "account": str(req.account),
+                "results": results,
+                "cancelled_count": len(results),
+                "skipped_count": 0,
+            }
+            self._store_idempotent(req.idempotency_key, "cancel_batch",
+                                   result, fingerprint)
+            self._persist()
+            logger.info("cancel_batch done account=%s cancelled=%d",
+                        req.account, len(results))
+            return result
+
+    def cancel_scope(self, req: Any) -> dict:
+        """Cancel every still-active order of an account (optionally per market).
+
+        Orders in scope that are no longer active are reported as skipped
+        (never as failures). One pass under the service lock, one persist.
+        """
+        with self._lock:
+            market = getattr(req, "market", None)
+            fingerprint = {
+                "type": "cancel_scope",
+                "account": str(req.account),
+                "market": str(market) if market else None,
+            }
+            cached = self._idempotency_check(req.idempotency_key, fingerprint)
+            if cached is not None:
+                logger.info("idempotent replay key=%s cancel_scope account=%s",
+                            req.idempotency_key, req.account)
+                return cached
+
+            if market is not None:
+                self._require_market(market)
+
+            results = []
+            cancelled = skipped = 0
+            for order in sorted(self.state.orders.values(),
+                                key=lambda o: o.sequence):
+                if order.account != req.account:
+                    continue
+                if market is not None and order.market != market:
+                    continue
+                if order.status in (OrderStatus.NEW,
+                                    OrderStatus.PARTIALLY_FILLED):
+                    asset, released = self._release_and_cancel(order)
+                    cancelled += 1
+                    results.append({
+                        "order_id": order.order_id,
+                        "market": order.market,
+                        "result": "cancelled",
+                        "asset": asset,
+                        "released_amount": str(released),
+                    })
+                else:
+                    skipped += 1
+                    results.append({
+                        "order_id": order.order_id,
+                        "market": order.market,
+                        "result": "skipped",
+                        "reason": f"order already {order.status.value}",
+                    })
+            result = {
+                "account": str(req.account),
+                "market": market,
+                "results": results,
+                "cancelled_count": cancelled,
+                "skipped_count": skipped,
+            }
+            self._store_idempotent(req.idempotency_key, "cancel_scope",
+                                   result, fingerprint)
+            self._persist()
+            logger.info("cancel_scope done account=%s market=%s cancelled=%d "
+                        "skipped=%d", req.account, market, cancelled, skipped)
+            return result
+
+    # ---------------------------------------------------------- reconciliation
+
+    def reconcile(self) -> dict:
+        """Read-only whole-ledger consistency check.
+
+        Verifies, without touching any state (and independently of market
+        halts or reference prices):
+
+        1. asset conservation: per asset, sum of all account balances
+           equals the total ever credited;
+        2. frozen consistency: per account/asset, the frozen counter
+           equals the sum of reservations of that account's active orders;
+        3. no negative balance or frozen counter anywhere.
+        """
+        with self._lock:
+            discrepancies: list[dict] = []
+
+            # ---- expected reservations derived from active orders
+            expected_frozen: dict[tuple[str, str], Decimal] = {}
+            for order in self.state.orders.values():
+                if order.status not in (OrderStatus.NEW,
+                                        OrderStatus.PARTIALLY_FILLED):
+                    continue
+                cfg = self.state.markets[order.market]
+                remaining = order.quantity - order.filled_qty
+                if order.side is Side.BUY:
+                    key = (order.account, cfg.quote_asset)
+                    amount = remaining * order.price
+                else:
+                    key = (order.account, cfg.base_asset)
+                    amount = remaining
+                expected_frozen[key] = expected_frozen.get(key, ZERO) + amount
+
+            # ---- frozen consistency per account/asset
+            frozen_keys = set(expected_frozen) | set(self.state.frozen)
+            for key in sorted(frozen_keys):
+                account, asset = key
+                expected = expected_frozen.get(key, ZERO)
+                actual = self.state.frozen.get(key, ZERO)
+                if actual != expected:
+                    discrepancies.append({
+                        "kind": "frozen_mismatch",
+                        "account": account,
+                        "asset": asset,
+                        "expected": str(expected),
+                        "actual": str(actual),
+                    })
+
+            # ---- asset conservation: balances vs total credited
+            totals: dict[str, Decimal] = {}
+            for (_account, asset), v in self.state.balances.items():
+                totals[asset] = totals.get(asset, ZERO) + v
+            for asset in sorted(set(totals) | set(self.state.credited)):
+                expected = self.state.credited.get(asset, ZERO)
+                actual = totals.get(asset, ZERO)
+                if actual != expected:
+                    discrepancies.append({
+                        "kind": "asset_conservation",
+                        "asset": asset,
+                        "expected": str(expected),
+                        "actual": str(actual),
+                    })
+
+            # ---- no negative counters
+            for (account, asset), v in sorted(self.state.balances.items()):
+                if v < ZERO:
+                    discrepancies.append({
+                        "kind": "negative_balance",
+                        "account": account,
+                        "asset": asset,
+                        "expected": ">= 0",
+                        "actual": str(v),
+                    })
+            for (account, asset), v in sorted(self.state.frozen.items()):
+                if v < ZERO:
+                    discrepancies.append({
+                        "kind": "negative_frozen",
+                        "account": account,
+                        "asset": asset,
+                        "expected": ">= 0",
+                        "actual": str(v),
+                    })
+
+            accounts = {acc for (acc, _a) in self.state.balances}
+            accounts |= {acc for (acc, _a) in self.state.frozen}
+            ok = not discrepancies
+            logger.info("reconcile ok=%s accounts=%d discrepancies=%d",
+                        ok, len(accounts), len(discrepancies))
+            return {
+                "ok": ok,
+                "checked_accounts": len(accounts),
+                "checked_assets": sorted(set(totals) | set(self.state.credited)),
+                "discrepancies": discrepancies,
+            }
 
     # -------------------------------------------------------------- queries
 
@@ -343,6 +625,31 @@ class DexService:
             return out
 
     # -------------------------------------------------------------- helpers
+
+    def _release_and_cancel(self, order: Order) -> tuple[str, Decimal]:
+        """Release the order's remaining reservation and mark it CANCELLED.
+
+        Returns ``(asset, released_amount)``. Caller must hold the lock and
+        must have verified the order is still active.
+        """
+        market = self.state.markets[order.market]
+        remaining = order.quantity - order.filled_qty
+        if order.side is Side.BUY:
+            asset, release = market.quote_asset, remaining * order.price
+        else:
+            asset, release = market.base_asset, remaining
+        key = (order.account, asset)
+        frozen = self.state.frozen.get(key, ZERO)
+        if frozen < release:
+            # should never happen with correct settlement; reported distinctly
+            raise DexError(
+                ErrorCode.INSUFFICIENT_FROZEN,
+                f"cannot release {release} {asset}, frozen={frozen} "
+                "(ledger corruption?)",
+            )
+        self.state.frozen[key] = frozen - release
+        order.status = OrderStatus.CANCELLED
+        return asset, release
 
     def _require_market(self, symbol: str) -> MarketConfig:
         cfg = self.state.markets.get(symbol)
